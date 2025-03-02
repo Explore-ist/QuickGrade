@@ -1,11 +1,33 @@
-import cv2
+import cv2 as cv
 import numpy as np
-#项目规划
-#对于图片的处理：
-#样卷处理：加载样卷->处理图片->(增强图片)->框选考题范围->存储考卷分割范围数据
-#批改加载：加载学生考卷->处理图片->(增强图片)->(可选)识别考号姓名->根据范围数据分割图片->分类存储
-#批改过程：选择题目->键入各题分数->将分数存入照片数据->结束所有批改
-#结果汇总：带有分数图片拼接回总试卷->导出数据
+import database as db
+#加载试卷
 
-class ImageProcessor:
-    pass
+def open_image(image_path):
+    img = cv.imread(image_path, cv.IMREAD_GRAYSCALE)
+    if img is None:
+        return
+    else:
+        return img
+
+def show_image(image_path,img):
+    if img is None:
+        return
+    else:
+        cv.imshow(image_path, img)
+        cv.waitKey(0)
+        cv.destroyAllWindows()
+
+
+#图片处理：非线性增强图片
+def exponential_transformation(image, c=255):
+    # 指数变换
+    normalized_image = image / 255.0
+    exp_image = c * (np.exp(normalized_image) - 1)
+    exp_image = np.clip(exp_image, 0, 255).astype(np.uint8)
+    return exp_image
+
+def image_segmentation():
+    #将图片分割后得到问题集的坐标集
+    problem_list=[]
+    return problem_list
