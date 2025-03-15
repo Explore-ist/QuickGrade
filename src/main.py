@@ -63,7 +63,7 @@ class ExamGradeConfigurator:
                         print(f"已保存: {self.current_region}")
                     elif confirm_key == 27:
                         self.current_region = None
-                        cv2.destroyWindows("Preview")
+                        cv2.destroyAllWindows()
             elif key == 27:
                 break
 
@@ -103,16 +103,16 @@ if __name__ == '__main__':
         regions = configurator.select_region("template.png")
 
         config = configurator.load_config("config.json")
-        student=cv2.imread("student1.jpg")
+        student_img=cv2.imread("student1.jpg")
         for idx,(x,y,w,h) in enumerate(config):
-            cropped=student[y:y+h,x:x+w]
+            cropped=student_img[y:y+h,x:x+w]
             gray=cv2.cvtColor(cropped,cv2.COLOR_BGR2GRAY)
             cv2.imshow(f"Questions",gray)
             cv2.waitKey(0)
             cv2.destroyAllWindows()
 
     except FileNotFoundError:
-        print(f'发生错误:{str(e)}')
+        print(f'发生错误')
     finally:
         cv2.destroyAllWindows()
 
