@@ -1,118 +1,80 @@
 import cv2
-import numpy as np
-import json
+import argparse
+from pathlib import Path
+from typing import List,Dict
+from src.gui.selector import RegionSelector
+from src.core.config import ConfigManager
+from src.utils.fileio import FileManager
+from src.utils.logger import setup_logger
 
-class ExamGradeConfigurator:
-    def __init__(self):
-        self.template_img = None
-        self.selected_regions = []
-        self.current_region = None
-        self.drawing = False
-        self.ix,self.iy = -1,-1
+logger = setup_logger()
 
-    def _mouse_callback(self, event, x, y, flags, param):
-        #鼠标回调函数
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.drawing = True
-            self.ix,self.iy = x,y
-            self.current_region = (x,y,0,0)
+def process_single_student(student_path: Path, config: Dict, output_dir: Path)->None:
+    try:
+        # 加载学生试卷
+        student_img = FileManager.safe_imread(student_path)
+        student_id = student_path.stem.split("_")[-1]
 
-        elif event == cv2.EVENT_MOUSEMOVE:
-            if self.drawing:
-                temp_img=self.template_img.copy()
-                cv2.rectangle(temp_img,(self.ix,self.iy),(x,y),(0,255,0),2)
-                cv2.imshow("Select_region",temp_img)
+        # 创建学生专属目录
+        student_output = output_dir / f"student_{student_id}"
+        student_output.mkdir(exist_ok=True)
 
-        elif event == cv2.EVENT_LBUTTONUP:
-            self.drawing = False
-            x1,y1=min(self.ix,x),min(self.iy,y)
-            x2,y2=max(self.ix,x),max(self.iy,y)
-            self.current_region = (x1,y1,x2-x1,y2-y1)
+        # 处理每个区域
+        for idx, region in enumerate(config["regions"], start=1):
+            x, y, w, h = region["x"], region["y"], region["width"], region["height"]
 
-    def select_region(self,template_path):
-        #控制函数
-        #1打开样板试卷
-        self.template_img = cv2.imread(template_path)
-        if self.template_img is None:
-            raise FileNotFoundError(f"{template_path} not found")
+            # 截取并保存区域
+            cropped = student_img[y:y + h, x:x + w]
+            output_path = student_output / f"Q{idx:02d}.png"
+            cv2.imwrite(str(output_path), cropped)
 
-        #2交互界面：
-        cv2.namedWindow("Select_region")
-        cv2.setMouseCallback("Select_region",self._mouse_callback)
+        logger.info(f"处理完成: {student_id}")
 
-        while True:
-            #3显示图像
-            display_img=self.template_img.copy()
-            for region in self.selected_regions:
-                x,y,w,h=region
-                cv2.rectangle(display_img,(x,y),(x+w,y+h),(0,0,255),2)
-            cv2.imshow("Select_region",display_img)
+    except Exception as e:
+        logger.error(f"处理失败 [{student_path.name}]: {str(e)}")
 
-            #4键盘等待
-            key = cv2.waitKey(1) & 0xFF
-            if key == 13:#如果划线区域满意->回车键
-                if self.current_region:
-                    #展示预览：
-                    x,y,w,h=self.current_region
-                    cropped=self.template_img[y:y+h,x:x+w]
-                    cv2.imshow("Select_region",cropped)
-                    #等待确认
-                    confirm_key = cv2.waitKey(0) & 0xFF
-                    if confirm_key == 13:
-                        self.selected_regions.append(self.current_region)
-                        print(f"已保存: {self.current_region}")
-                    elif confirm_key == 27:
-                        self.current_region = None
-                        cv2.destroyAllWindows()
-            elif key == 27:
-                break
 
-        cv2.destroyAllWindows()
-        self.save_config("config.json")
-        print('配置已保存')
-        return self.selected_regions
-
-    def save_config(self,config_path):
-        #保存选区位置
-        config={
-            "regions":[
-                {
-                    "x":r[0],
-                    "y":r[1],
-                    "width":r[2],
-                    "height":r[3]
-                }for r in self.selected_regions
-            ]
-        }
-        with open(config_path,"w") as f:
-            json.dump(config,f,indent=2)
-
-    @staticmethod
-    def load_config(config_path):
-        with open(config_path) as f:
-            config=json.load(f)
-            return [
-                (r['x'],r['y'],r['width'],r['height'])
-                for r in config['regions']
-            ]
-
-if __name__ == '__main__':
-    configurator = ExamGradeConfigurator()
+def main():
+    parser = argparse.ArgumentParser(description="QuickGrade")
+    parser.add_argument("--template",
+                        default=r"D:\System\Desktop\py\QuickGrade\data\templates\template.png",
+                        help="样板试卷路径")
+    parser.add_argument("--config", default="data/configs/default.json", help="配置文件路径")
+    parser.add_argument("--input", default="data/students", help="学生试卷目录")
+    parser.add_argument("--output", default="data/results", help="输出目录")
+    args = parser.parse_args()
+    #初始化：
+    config_manager = ConfigManager(args.config)
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        regions = configurator.select_region("template.png")
+        #模式选择
+        if not Path(args.config).exists():
+            logger.info("未找到配置文件，进入区域标注模式")
+            selector = RegionSelector()
+            regions = selector.run(args.template)
+            config_manager.save_config(regions)
+            logger.info(f"配置已保存至 {args.config}")
+        #批量处理模式
+        logger.info("启动批量处理流程")
+        config = config_manager.load_config()
+        student_files = FileManager.find_student_files(args.input)
+        # 并行处理
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            for student_file in student_files:
+                executor.submit(
+                    process_single_student,
+                    student_file,
+                    config,
+                    output_dir
+                )
+        logger.info(f"处理完成，结果保存在 {output_dir}")
 
-        config = configurator.load_config("config.json")
-        student_img=cv2.imread("student1.jpg")
-        for idx,(x,y,w,h) in enumerate(config):
-            cropped=student_img[y:y+h,x:x+w]
-            gray=cv2.cvtColor(cropped,cv2.COLOR_BGR2GRAY)
-            cv2.imshow(f"Questions",gray)
-            cv2.waitKey(0)
-            cv2.destroyAllWindows()
+    except Exception as e:
+        logger.critical(f"程序运行失败: {str(e)}")
+        raise
 
-    except FileNotFoundError:
-        print(f'发生错误')
-    finally:
-        cv2.destroyAllWindows()
-
+if __name__ == "__main__":
+    main()
