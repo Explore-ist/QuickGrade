@@ -1,0 +1,33 @@
+{
+  "total_regions": 4,
+  "regions": [
+    {
+      "order": 1,
+      "x": 79,
+      "y": 135,
+      "width": 232,
+      "height": 263
+    },
+    {
+      "order": 2,
+      "x": 370,
+      "y": 117,
+      "width": 244,
+      "height": 149
+    },
+    {
+      "order": 3,
+      "x": 366,
+      "y": 304,
+      "width": 266,
+      "height": 255
+    },
+    {
+      "order": 4,
+      "x": 688,
+      "y": 61,
+      "width": 207,
+      "height": 434
+    }
+  ]
+}
