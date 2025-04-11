@@ -3,13 +3,13 @@
   +---选区划分
   +---批量处理
 """
-import cv2
 import os
+import cv2
+import json
 import numpy as np
+from pathlib import Path
 from typing import List, Tuple, Optional
 
-import json
-from pathlib import Path
 
 class Redistricting:
     """
@@ -177,7 +177,7 @@ class StudentProcessing:
             "total_regions":len(self.saved_region),
             "regions":[
                 {
-                    "order": idx + 1,
+                    "order": idx,
                     "x": r[0],
                     "y": r[1],
                     "width": r[2],
@@ -208,7 +208,7 @@ class StudentProcessing:
         ]
         return regions
 
-
+#该模块的测试样例
 if __name__ == '__main__':
     script_dir=os.path.dirname(os.path.abspath(__file__))
 

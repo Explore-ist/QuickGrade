@@ -2,32 +2,32 @@
   "total_regions": 4,
   "regions": [
     {
+      "order": 0,
+      "x": 273,
+      "y": 119,
+      "width": 212,
+      "height": 215
+    },
+    {
       "order": 1,
-      "x": 79,
-      "y": 135,
-      "width": 232,
-      "height": 263
+      "x": 546,
+      "y": 96,
+      "width": 75,
+      "height": 390
     },
     {
       "order": 2,
-      "x": 370,
-      "y": 117,
-      "width": 244,
-      "height": 149
+      "x": 657,
+      "y": 123,
+      "width": 184,
+      "height": 163
     },
     {
       "order": 3,
-      "x": 366,
-      "y": 304,
-      "width": 266,
-      "height": 255
-    },
-    {
-      "order": 4,
-      "x": 688,
-      "y": 61,
-      "width": 207,
-      "height": 434
+      "x": 675,
+      "y": 340,
+      "width": 173,
+      "height": 178
     }
   ]
 }
