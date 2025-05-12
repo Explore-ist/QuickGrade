@@ -1,79 +1,48 @@
 ﻿"""
 --+--output
-  +--输出脚本 (升级版 v1.8)
-------------------------------------------------------
-### 修正
-* **修复 `DataFrame` 对象被错误调用**（多余 `(rows)[all_cols]`）。
-* **整理 `export_excel()` 逻辑**，去掉重复代码、修正缩进。
-* 默认仍只导出大题列；如需小题改 `EXPORT_SUBS = True`。
+  +--输出脚本  v2.1  （成绩导表 + 自动“标分上图”）
+===================================================================
+1. **成绩导表** (`export_excel`) —— 与 v1.8 相同，默认仅导出大题列，`EXPORT_SUBS=True` 可含小题。
+2. **自动标分 & 批注写图** (`save_all_marked_images`)
+   * 读取 `src/data/configs/default.json`（若有 `questions.json` 优先）的大题/小题坐标。
+   * 读取 `result.json` 的 `scores` 矩阵 → 每题 / 小题得分。
+   * 在 `src/data/stitched/1.png、2.png…` 原卷上：
+       - 用红框圈出大题区块，并在左上角写“大题总分”。
+       - 在每个小题框左上角写对应得分（绿色）。
+   * 叠加手工自由曲线记号：`result.json['marks']` 中的 `"stu|q|sub"` → 点集数组。
+   * 输出至 `src/data/save/{学生序号}_{原文件名}`，目录自动创建。
+
+依赖：pandas、openpyxl、opencv-python、numpy
+===================================================================
 """
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
 import pandas as pd
 
-from path import CONFIGS_PATH, RESULTS_PATH, DATA_PATH, STUDENTS_PATH, WORK_PATH
+from path import CONFIGS_PATH, RESULTS_PATH, DATA_PATH, STUDENTS_PATH, STITCHED_PATH, WORK_PATH
 
+# -------------------------------------------------- 常量 --------------------------------------------------
 RESULT_JSON = Path(CONFIGS_PATH) / "result.json"
 RESULT_XLSX = Path(RESULTS_PATH) / "result.xlsx"
 SAVE_DIR = Path(DATA_PATH) / "save"
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
-# --------------------------------------------------
-# 数据加载与归一化
-# --------------------------------------------------
+_RED = (0, 0, 255)     # BGR
+_GREEN = (0, 255, 0)
+_BLUE = (255, 0, 0)
+_THICK = 2
+_FONT = cv2.FONT_HERSHEY_SIMPLEX
 
-def _from_matrix(obj: Dict[str, Any]) -> List[Dict]:
-    scores_mat: List[List[List[Any]]] = obj.get("scores", [])
-    total_q: int = obj.get("total_questions", 0)
-    students: List[Dict] = []
-    for s_idx, stu_q_scores in enumerate(scores_mat, start=1):
-        scores_flat: Dict[str, float] = {}
-        for q_idx in range(total_q):
-            subs = stu_q_scores[q_idx] if q_idx < len(stu_q_scores) else []
-            if not isinstance(subs, list):
-                subs = []
-            big_id = str(q_idx + 1)
-            for sub_idx, val in enumerate(subs, start=1):
-                scores_flat[f"{big_id}.{sub_idx}"] = val
-            scores_flat[big_id] = sum(subs)
-        students.append({"student": f"学生{s_idx}", "scores": scores_flat, "marks": []})
-    return students
+EXPORT_SUBS = False  # True → Excel 里包含小题列
 
-
-def _normalize_entry(name: str, entry: Any) -> Dict:
-    if isinstance(entry, dict):
-        student = entry.get("student", name) or name
-        scores = {str(k): v for k, v in entry.get("scores", entry).items() if isinstance(v, (int, float, dict))}
-        marks = entry.get("marks", [])
-    else:
-        student = name
-        scores = {str(k): v for k, v in (entry if isinstance(entry, dict) else {}).items()}
-        marks = []
-    return {"student": student, "scores": scores, "marks": marks}
-
-
-def _load_result() -> List[Dict]:
-    if not RESULT_JSON.exists():
-        raise FileNotFoundError(f"找不到 {RESULT_JSON}")
-    with open(RESULT_JSON, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    if isinstance(data, dict) and isinstance(data.get("scores"), list):
-        return _from_matrix(data)
-    if isinstance(data, list):
-        return [_normalize_entry(f"stu{i+1}", itm) for i, itm in enumerate(data)]
-    if isinstance(data, dict):
-        return [_normalize_entry(name, itm) for name, itm in data.items()]
-    raise ValueError("result.json 格式无法识别！")
-
-# --------------------------------------------------
-# 工具函数
-# --------------------------------------------------
+# -------------------------------------------------- 工具 --------------------------------------------------
 
 def _pretty_path(p: Path) -> str:
     for base in (WORK_PATH, Path.cwd()):
@@ -84,122 +53,151 @@ def _pretty_path(p: Path) -> str:
     return str(p)
 
 
-def _nat_key_seg(seg: str):
+def _nat_key(seg: str):
     return int(seg) if seg.isdigit() else seg
 
 
 def _natural_sort(cols: List[str]) -> List[str]:
     others = [c for c in cols if c not in ("学生", "总分")]
-    others.sort(key=lambda c: tuple(_nat_key_seg(s) for s in c.split('.')))
-    result = ["学生"] + others + (["总分"] if "总分" in cols else [])
-    return result
+    others.sort(key=lambda x: tuple(_nat_key(s) for s in x.split('.')))
+    return ["学生"] + others + (["总分"] if "总分" in cols else [])
 
-# --------------------------------------------------
-# Excel 导出
-# --------------------------------------------------
+# -------------------------------------------------- JSON 读取 --------------------------------------------------
 
-EXPORT_SUBS = False  # 改成 True 可导出小题列
+def _load_result_raw() -> Dict[str, Any]:
+    if not RESULT_JSON.exists():
+        raise FileNotFoundError("未找到 result.json！请先运行批改流程。")
+    with open(RESULT_JSON, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def _is_sub(col: str) -> bool:
-    return '.' in col
+def _from_matrix(obj: Dict[str, Any]) -> List[Dict]:
+    mat: List[List[List[Any]]] = obj.get("scores", [])
+    total_q: int = obj.get("total_questions", 0)
+    res: List[Dict] = []
+    for s_idx, stu_q_scores in enumerate(mat, 1):
+        scores_flat: Dict[str, float] = {}
+        for q_idx in range(total_q):
+            subs = stu_q_scores[q_idx] if q_idx < len(stu_q_scores) else []
+            if not isinstance(subs, list):
+                subs = []
+            big_id = str(q_idx + 1)
+            scores_flat[big_id] = sum(subs)
+            for sub_idx, val in enumerate(subs, 1):
+                scores_flat[f"{big_id}.{sub_idx}"] = val
+        res.append({"student": f"学生{s_idx}", "scores": scores_flat})
+    return res
 
+
+def _load_result_for_excel() -> List[Dict]:
+    raw = _load_result_raw()
+    if "scores" in raw and isinstance(raw["scores"], list):
+        return _from_matrix(raw)
+    raise ValueError("当前版本仅支持批改流程导出的矩阵格式 result.json！")
+
+# -------------------------------------------------- Excel 导出 --------------------------------------------------
 
 def export_excel():
-    data = _load_result()
-
-    # ---- 构建行 ----
-    rows: List[Dict[str, Any]] = []
-    for stu in data:
-        row: Dict[str, Any] = {"学生": stu["student"]}
+    rows = []
+    for stu in _load_result_for_excel():
+        row = {"学生": stu["student"]}
         for k, v in stu["scores"].items():
-            if not EXPORT_SUBS and _is_sub(k):
+            if not EXPORT_SUBS and "." in k:
                 continue
             row[k] = v
-        row["总分"] = sum(val for key, val in row.items() if key.isdigit())
+        row["总分"] = sum(v for k, v in row.items() if k.isdigit())
         rows.append(row)
 
-    # ---- 计算列顺序 ----
-    col_set = {c for r in rows for c in r}
-    if not EXPORT_SUBS:
-        col_set = {c for c in col_set if not _is_sub(c) or c in ("学生", "总分")}
-    all_cols = _natural_sort(list(col_set))
-
-    # ---- 写 Excel ----
-    df = pd.DataFrame(rows)[all_cols]
+    cols = _natural_sort(list({c for r in rows for c in r}))
+    df = pd.DataFrame(rows)[cols]
     RESULT_XLSX.parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(RESULT_XLSX, sheet_name="Sheet1", index=False)
-    print(f"✔ 成绩已导出 → {_pretty_path(RESULT_XLSX)}")
+    print("✔ 成绩表已导出 →", _pretty_path(RESULT_XLSX))
 
-# --------------------------------------------------
-# 批注写图（增强实现）
-# --------------------------------------------------
+# -------------------------------------------------- 题目坐标 --------------------------------------------------
 
-_RED = (0, 0, 255)
-_GREEN = (0, 255, 0)
-_THICK = 2
+def _load_questions_cfg() -> Dict[str, Any]:
+    cfg_file = Path(CONFIGS_PATH, "questions.json") if Path(CONFIGS_PATH, "questions.json").exists() else Path(CONFIGS_PATH, "default.json")
+    with open(cfg_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {str(q["id"]): q for q in data["questions"]}
+
+# -------------------------------------------------- 图片 I/O --------------------------------------------------
+
+def _read_stitched(stu_idx: int) -> Tuple[np.ndarray, Path]:
+    base = Path(STITCHED_PATH, f"{stu_idx+1}")
+    for ext in (".png", ".jpg", ".jpeg", ".bmp"):
+        p = base.with_suffix(ext)
+        if p.exists():
+            img = cv2.imread(str(p))
+            return img, p
+    raise FileNotFoundError(f"未找到学生卷面：{base}.[png/jpg/jpeg/bmp]")
+
+# -------------------------------------------------- 批注绘制 --------------------------------------------------
+
+def _draw_scores(img: np.ndarray, q_cfg: Dict, scores: List[Any]):
+    big_total = sum(scores)
+    # 大题块
+    for seg in q_cfg.get("segments", []):
+        x, y, w, h = seg
+        cv2.rectangle(img, (x, y), (x + w, y + h), _RED, _THICK)
+        cv2.putText(img, str(big_total), (x + 5, y + 30), _FONT, 1.0, _GREEN, 2)
+    # 小题
+    for sub_idx, sub_cfg in enumerate(q_cfg.get("subs", []), 1):
+        if sub_idx > len(scores):
+            break
+        val = scores[sub_idx - 1]
+        for seg in sub_cfg.get("segments", []):
+            x, y, w, h = seg
+            cv2.putText(img, str(val), (x + 5, y + 25), _FONT, 0.8, _GREEN, 2)
 
 
-def _draw_marks(img: np.ndarray, marks: List[Dict]):
-    """根据 marks 列表在 img 上作图。支持 rect / point / text / polyline。"""
-    for m in marks:
-        tp = m.get("type", "rect")
-        if tp == "rect":
-            x, y, w, h = m["xywh"]
-            cv2.rectangle(img, (x, y), (x + w, y + h), _RED, _THICK)
-        elif tp == "point":
-            x, y = m["xy"]
-            cv2.circle(img, (x, y), 6, _GREEN, -1)
-        elif tp == "text":
-            x, y = m["xy"]
-            cv2.putText(img, m.get("content", "√"), (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, _RED, 2)
-        elif tp == "polyline":  # 自由曲线
-            pts = np.array(m["points"], dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(img, [pts], isClosed=False, color=_GREEN, thickness=_THICK)
-        else:
-            print(f"⚠ 未知记号类型：{tp}")
-
-
-def _iter_image_marks(stu_marks: List[Any]):
-    """兼容两种格式：
-    1. [{"img":"...","marks":[...]}, ...]
-    2. [{"img":"...","type":"rect",...}, ...]  # 全部同一张图
-    """
-    if not stu_marks:
+def _draw_polyline(img: np.ndarray, pts: List[List[int]]):
+    if len(pts) < 2:
         return
-    # 情况 1：每项都带 marks 列表
-    if all(isinstance(it, dict) and "marks" in it for it in stu_marks):
-        for itm in stu_marks:
-            yield itm["img"], itm["marks"]
-    else:
-        # 情况 2：把所有标注视为同一个文件（必须每条都带 img）
-        by_img: Dict[str, List] = {}
-        for m in stu_marks:
-            img_path = m.get("img")
-            if not img_path:
-                continue
-            by_img.setdefault(img_path, []).append(m)
-        for img_path, marks in by_img.items():
-            yield img_path, marks
+    arr = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
+    cv2.polylines(img, [arr], isClosed=False, color=_BLUE, thickness=_THICK)
 
+# -------------------------------------------------- 主批注函数 --------------------------------------------------
 
 def save_all_marked_images():
-    data = _load_result()
-    for stu in data:
-        for rel_img_path, marks in _iter_image_marks(stu.get("marks", [])):
-            src = Path(STUDENTS_PATH) / rel_img_path
-            img = cv2.imread(str(src))
-            if img is None:
-                print(f"⚠ 无法读取 {src}")
-                continue
-            _draw_marks(img, marks)
-            dst_name = f"{stu['student']}_{src.name}"
-            dst = SAVE_DIR / dst_name
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(dst), img)
-            print(f"✔ 批注已写入 → {_pretty_path(dst)}")
+    raw = _load_result_raw()
+    scores_mat: List[List[List[Any]]] = raw["scores"]
+    marks_dict: Dict[str, Any] = raw.get("marks", {})
+    q_map = _load_questions_cfg()
 
-# --------------------------------------------------
+    total_students = len(scores_mat)
+    for stu_idx in range(total_students):
+        try:
+            img, src_path = _read_stitched(stu_idx)
+        except FileNotFoundError as e:
+            print("⚠", e)
+            continue
+
+        # ---- 自动标分 ----
+        for q_idx, q_scores in enumerate(scores_mat[stu_idx]):
+            q_cfg = q_map.get(str(q_idx + 1))
+            if q_cfg:
+                _draw_scores(img, q_cfg, q_scores)
+
+        # ---- 叠加手工 marks ----
+        for key, strokes in marks_dict.items():
+            try:
+                s, q, sub = map(int, key.split("|"))
+            except ValueError:
+                continue
+            if s != stu_idx:
+                continue
+            for stroke in strokes:
+                _draw_polyline(img, stroke)
+
+        # ---- 保存 ----
+        dst = SAVE_DIR / f"{stu_idx+1}_{src_path.name}"
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(dst), img)
+        print("✔ 批注图已保存 →", _pretty_path(dst))
+
+# -------------------------------------------------- CLI --------------------------------------------------
 if __name__ == "__main__":
     export_excel()
     save_all_marked_images()

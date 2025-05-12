@@ -1,203 +1,206 @@
-﻿"""
---+--output
-  +--输出脚本  v2.1  （成绩导表 + 自动“标分上图”）
-===================================================================
-1. **成绩导表** (`export_excel`) —— 与 v1.8 相同，默认仅导出大题列，`EXPORT_SUBS=True` 可含小题。
-2. **自动标分 & 批注写图** (`save_all_marked_images`)
-   * 读取 `src/data/configs/default.json`（若有 `questions.json` 优先）的大题/小题坐标。
-   * 读取 `result.json` 的 `scores` 矩阵 → 每题 / 小题得分。
-   * 在 `src/data/stitched/1.png、2.png…` 原卷上：
-       - 用红框圈出大题区块，并在左上角写“大题总分”。
-       - 在每个小题框左上角写对应得分（绿色）。
-   * 叠加手工自由曲线记号：`result.json['marks']` 中的 `"stu|q|sub"` → 点集数组。
-   * 输出至 `src/data/save/{学生序号}_{原文件名}`，目录自动创建。
+﻿# -*- coding: utf-8 -*-
+"""
+改卷主程 ‑ Freehand 记号版
+========================================
+**新增功能**
+🔹 记号从“直线”升级为**自由曲线**：左键按住拖动即实时绘制，抬起鼠标结束一条曲线；右键撤销最近一条曲线。
+🔹 曲线数据以点集形式保存 `[(x1,y1), (x2,y2), ...]`，后续可精确复现。
+🔹 Ctrl+滚轮缩放、题‑小题‑学生遍历、多位分数输入等既有功能保持不变。
 
-依赖：pandas、openpyxl、opencv-python、numpy
-===================================================================
+依赖：OpenCV‑Python ≥4.6、NumPy、dataclasses（Py3.7+ 标准库）。
 """
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import pandas as pd
 
-from path import CONFIGS_PATH, RESULTS_PATH, DATA_PATH, STUDENTS_PATH, STITCHED_PATH, WORK_PATH
-
-# -------------------------------------------------- 常量 --------------------------------------------------
-RESULT_JSON = Path(CONFIGS_PATH) / "result.json"
-RESULT_XLSX = Path(RESULTS_PATH) / "result.xlsx"
-SAVE_DIR = Path(DATA_PATH) / "save"
-SAVE_DIR.mkdir(parents=True, exist_ok=True)
-
-_RED = (0, 0, 255)     # BGR
-_GREEN = (0, 255, 0)
-_BLUE = (255, 0, 0)
-_THICK = 2
-_FONT = cv2.FONT_HERSHEY_SIMPLEX
-
-EXPORT_SUBS = False  # True → Excel 里包含小题列
-
-# -------------------------------------------------- 工具 --------------------------------------------------
-
-def _pretty_path(p: Path) -> str:
-    for base in (WORK_PATH, Path.cwd()):
-        try:
-            return str(p.relative_to(base))
-        except ValueError:
-            continue
-    return str(p)
+from path import CONFIGS_PATH, STITCHED_PATH
+from input import StudentProcessing, Question, SubQuestion, Region
 
 
-def _nat_key(seg: str):
-    return int(seg) if seg.isdigit() else seg
+class Teacher:
+    WIN = "question"
+
+    def __init__(self):
+        # ---------- 载入配置 ----------
+        self.questions: List[Question] = StudentProcessing.load(Path(CONFIGS_PATH, "default.json"))
+        self.total_questions = len(self.questions)
+        self.total_students = self._count_students()
+
+        self.present_question = 0
+        self.present_sub = 0
+        self.present_student = 0
+
+        # ---------- 成绩 & 记号 ----------
+        max_sub = max(max(len(q.subs), 1) for q in self.questions)
+        self.score_matrix = np.zeros((self.total_students, self.total_questions, max_sub), dtype=int)
+        # marks[(stu, q, sub)] -> List[List[(x,y)]]  (每条曲线是点集)
+        self.marks: Dict[Tuple[int, int, int], List[List[Tuple[int, int]]]] = {}
+
+        # ---------- 显示 ----------
+        self.zoom = 1.0
+        self._curr_img: Optional[np.ndarray] = None
+        self._stroke: Optional[List[Tuple[int, int]]] = None   # 正在绘制的曲线 (原始坐标)
+
+        cv2.namedWindow(self.WIN)
+        cv2.setMouseCallback(self.WIN, self._mouse_cb)
+
+    # -------------------------------------------------- 运行主循环 --------------------------------------------------
+    def run(self):
+        while self.present_question < self.total_questions:
+            q = self.questions[self.present_question]
+            sub_cnt = max(1, len(q.subs))
+
+            while self.present_sub < sub_cnt:
+                while self.present_student < self.total_students:
+                    self._grade_item(q, self.present_sub)
+                    self.present_student += 1
+
+                self.present_student = 0
+                self.present_sub += 1
+
+            self.present_sub = 0
+            self.present_question += 1
+
+        self._finish()
+
+    # -------------------------------------------------- 批改单项 --------------------------------------------------
+    def _grade_item(self, q: Question, sub_idx: int):
+        img, origin = self._crop(q, sub_idx)
+        self._show(img)
+
+        score = self._read_score()
+        self.score_matrix[self.present_student, self.present_question, sub_idx] = score
+
+        # 将曲线坐标平移到整卷坐标
+        key = (self.present_student, self.present_question, sub_idx)
+        if key in self.marks:
+            self.marks[key] = [[(x+origin[0], y+origin[1]) for (x, y) in stroke] for stroke in self.marks[key]]
+
+    # -------------------------------------------------- 裁剪题/小题 --------------------------------------------------
+    def _crop(self, q: Question, sub_idx: int):
+        stu_img = self._read_stitched(self.present_student)
+        if stu_img is None:
+            raise FileNotFoundError("无法读取学生卷面！")
+
+        if not q.subs:
+            seg = q.segments[sub_idx] if len(q.segments) > 1 else q.segments[0]
+        else:
+            seg = q.subs[sub_idx].segments[0]
+        x, y, w, h = seg.to_tuple()
+        return stu_img[y:y+h, x:x+w], (x, y)
+
+    # -------------------------------------------------- 分数输入 --------------------------------------------------
+    def _read_score(self):
+        buf = ""
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        while True:
+            disp = self._apply_zoom(self._render_with_marks())
+            cv2.putText(disp, f"Score: {buf}", (10, 30), font, 1, (0, 0, 255), 2)
+            cv2.imshow(self.WIN, disp)
+            key = cv2.waitKey(0) & 0xFF
+            if ord("0") <= key <= ord("9"):
+                buf += chr(key)
+            elif key in (8, 127):
+                buf = buf[:-1]
+            elif key == 13 and buf:
+                return int(buf)
+
+    # -------------------------------------------------- 渲染当前图 + 记号 --------------------------------------------------
+    def _render_with_marks(self):
+        if self._curr_img is None:
+            return np.zeros((10, 10, 3), dtype=np.uint8)
+        img = self._curr_img.copy()
+        key = (self.present_student, self.present_question, self.present_sub)
+        for stroke in self.marks.get(key, []):
+            if len(stroke) >= 2:
+                pts = np.array(stroke, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(img, [pts], False, (0, 0, 255), 2)
+        # 若正在绘制
+        if self._stroke and len(self._stroke) >= 2:
+            pts = np.array(self._stroke, dtype=np.int32).reshape((-1, 1, 2))
+            cv2.polylines(img, [pts], False, (0, 0, 255), 1)
+        return img
+
+    # -------------------------------------------------- 显示 --------------------------------------------------
+    def _apply_zoom(self, img: np.ndarray):
+        if abs(self.zoom - 1.0) < 1e-3:
+            return img
+        return cv2.resize(img, None, fx=self.zoom, fy=self.zoom,
+                          interpolation=cv2.INTER_AREA if self.zoom < 1 else cv2.INTER_LINEAR)
+
+    def _show(self, img: np.ndarray):
+        self._curr_img = img
+        cv2.imshow(self.WIN, self._apply_zoom(self._render_with_marks()))
+
+    # -------------------------------------------------- 鼠标回调 --------------------------------------------------
+    def _mouse_cb(self, event, x, y, flags, param):
+        # ---- 缩放 Ctrl+滚轮 ----
+        if event == cv2.EVENT_MOUSEWHEEL and (flags & cv2.EVENT_FLAG_CTRLKEY):
+            delta = (flags >> 16)
+            if delta > 32767:
+                delta -= 65536
+            self.zoom *= 1.1 if delta > 0 else 1/1.1
+            self.zoom = max(0.2, min(5.0, self.zoom))
+            if self._curr_img is not None:
+                cv2.imshow(self.WIN, self._apply_zoom(self._render_with_marks()))
+            return
+
+        # ---- 自由曲线记号 ----
+        real_pt = (int(x / self.zoom), int(y / self.zoom))
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self._stroke = [real_pt]
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if self._stroke is not None:
+                # 避免太密：只有距离大于1像素才记录
+                if np.hypot(real_pt[0]-self._stroke[-1][0], real_pt[1]-self._stroke[-1][1]) >= 1:
+                    self._stroke.append(real_pt)
+                cv2.imshow(self.WIN, self._apply_zoom(self._render_with_marks()))
+        elif event == cv2.EVENT_LBUTTONUP and self._stroke is not None:
+            key = (self.present_student, self.present_question, self.present_sub)
+            self.marks.setdefault(key, []).append(self._stroke)
+            self._stroke = None
+            self._show(self._curr_img)  # 重绘
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            key = (self.present_student, self.present_question, self.present_sub)
+            if self.marks.get(key):
+                self.marks[key].pop()
+                self._show(self._curr_img)
+
+    # -------------------------------------------------- 读 stitched --------------------------------------------------
+    def _read_stitched(self, idx: int):
+        base = Path(STITCHED_PATH, f"{idx+1}")
+        for ext in (".png", ".jpg", ".jpeg", ".bmp"):
+            p = base.with_suffix(ext)
+            if p.exists():
+                return cv2.imread(str(p))
+        return None
+
+    # -------------------------------------------------- 学生数 --------------------------------------------------
+    def _count_students(self):
+        return len([p for p in Path(STITCHED_PATH).iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}])
+
+    # -------------------------------------------------- 结束 --------------------------------------------------
+    def _finish(self):
+        # 曲线序列化：[[[x,y], ...], ...]
+        serial_marks = {"|".join(map(str, k)): [list(map(list, stroke)) for stroke in v] for k, v in self.marks.items()}
+        result = {
+            "total_students": int(self.total_students),
+            "total_questions": int(self.total_questions),
+            "scores": self.score_matrix.tolist(),
+            "marks": serial_marks,
+        }
+        Path(CONFIGS_PATH).mkdir(parents=True, exist_ok=True)
+        with open(Path(CONFIGS_PATH, "result.json"), "w", encoding="utf-8") as f:
+            json.dump(result, f, ensure_ascii=Fal0se, indent=2)
+        cv2.destroyAllWindows()
+        print("✔ 批改完成，结果已保存到 result.json")
 
 
-def _natural_sort(cols: List[str]) -> List[str]:
-    others = [c for c in cols if c not in ("学生", "总分")]
-    others.sort(key=lambda x: tuple(_nat_key(s) for s in x.split('.')))
-    return ["学生"] + others + (["总分"] if "总分" in cols else [])
-
-# -------------------------------------------------- JSON 读取 --------------------------------------------------
-
-def _load_result_raw() -> Dict[str, Any]:
-    if not RESULT_JSON.exists():
-        raise FileNotFoundError("未找到 result.json！请先运行批改流程。")
-    with open(RESULT_JSON, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _from_matrix(obj: Dict[str, Any]) -> List[Dict]:
-    mat: List[List[List[Any]]] = obj.get("scores", [])
-    total_q: int = obj.get("total_questions", 0)
-    res: List[Dict] = []
-    for s_idx, stu_q_scores in enumerate(mat, 1):
-        scores_flat: Dict[str, float] = {}
-        for q_idx in range(total_q):
-            subs = stu_q_scores[q_idx] if q_idx < len(stu_q_scores) else []
-            if not isinstance(subs, list):
-                subs = []
-            big_id = str(q_idx + 1)
-            scores_flat[big_id] = sum(subs)
-            for sub_idx, val in enumerate(subs, 1):
-                scores_flat[f"{big_id}.{sub_idx}"] = val
-        res.append({"student": f"学生{s_idx}", "scores": scores_flat})
-    return res
-
-
-def _load_result_for_excel() -> List[Dict]:
-    raw = _load_result_raw()
-    if "scores" in raw and isinstance(raw["scores"], list):
-        return _from_matrix(raw)
-    raise ValueError("当前版本仅支持批改流程导出的矩阵格式 result.json！")
-
-# -------------------------------------------------- Excel 导出 --------------------------------------------------
-
-def export_excel():
-    rows = []
-    for stu in _load_result_for_excel():
-        row = {"学生": stu["student"]}
-        for k, v in stu["scores"].items():
-            if not EXPORT_SUBS and "." in k:
-                continue
-            row[k] = v
-        row["总分"] = sum(v for k, v in row.items() if k.isdigit())
-        rows.append(row)
-
-    cols = _natural_sort(list({c for r in rows for c in r}))
-    df = pd.DataFrame(rows)[cols]
-    RESULT_XLSX.parent.mkdir(parents=True, exist_ok=True)
-    df.to_excel(RESULT_XLSX, sheet_name="Sheet1", index=False)
-    print("✔ 成绩表已导出 →", _pretty_path(RESULT_XLSX))
-
-# -------------------------------------------------- 题目坐标 --------------------------------------------------
-
-def _load_questions_cfg() -> Dict[str, Any]:
-    cfg_file = Path(CONFIGS_PATH, "questions.json") if Path(CONFIGS_PATH, "questions.json").exists() else Path(CONFIGS_PATH, "default.json")
-    with open(cfg_file, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return {str(q["id"]): q for q in data["questions"]}
-
-# -------------------------------------------------- 图片 I/O --------------------------------------------------
-
-def _read_stitched(stu_idx: int) -> Tuple[np.ndarray, Path]:
-    base = Path(STITCHED_PATH, f"{stu_idx+1}")
-    for ext in (".png", ".jpg", ".jpeg", ".bmp"):
-        p = base.with_suffix(ext)
-        if p.exists():
-            img = cv2.imread(str(p))
-            return img, p
-    raise FileNotFoundError(f"未找到学生卷面：{base}.[png/jpg/jpeg/bmp]")
-
-# -------------------------------------------------- 批注绘制 --------------------------------------------------
-
-def _draw_scores(img: np.ndarray, q_cfg: Dict, scores: List[Any]):
-    big_total = sum(scores)
-    # 大题块
-    for seg in q_cfg.get("segments", []):
-        x, y, w, h = seg
-        cv2.rectangle(img, (x, y), (x + w, y + h), _RED, _THICK)
-        cv2.putText(img, str(big_total), (x + 5, y + 30), _FONT, 1.0, _GREEN, 2)
-    # 小题
-    for sub_idx, sub_cfg in enumerate(q_cfg.get("subs", []), 1):
-        if sub_idx > len(scores):
-            break
-        val = scores[sub_idx - 1]
-        for seg in sub_cfg.get("segments", []):
-            x, y, w, h = seg
-            cv2.putText(img, str(val), (x + 5, y + 25), _FONT, 0.8, _GREEN, 2)
-
-
-def _draw_polyline(img: np.ndarray, pts: List[List[int]]):
-    if len(pts) < 2:
-        return
-    arr = np.array(pts, dtype=np.int32).reshape((-1, 1, 2))
-    cv2.polylines(img, [arr], isClosed=False, color=_BLUE, thickness=_THICK)
-
-# -------------------------------------------------- 主批注函数 --------------------------------------------------
-
-def save_all_marked_images():
-    raw = _load_result_raw()
-    scores_mat: List[List[List[Any]]] = raw["scores"]
-    marks_dict: Dict[str, Any] = raw.get("marks", {})
-    q_map = _load_questions_cfg()
-
-    total_students = len(scores_mat)
-    for stu_idx in range(total_students):
-        try:
-            img, src_path = _read_stitched(stu_idx)
-        except FileNotFoundError as e:
-            print("⚠", e)
-            continue
-
-        # ---- 自动标分 ----
-        for q_idx, q_scores in enumerate(scores_mat[stu_idx]):
-            q_cfg = q_map.get(str(q_idx + 1))
-            if q_cfg:
-                _draw_scores(img, q_cfg, q_scores)
-
-        # ---- 叠加手工 marks ----
-        for key, strokes in marks_dict.items():
-            try:
-                s, q, sub = map(int, key.split("|"))
-            except ValueError:
-                continue
-            if s != stu_idx:
-                continue
-            for stroke in strokes:
-                _draw_polyline(img, stroke)
-
-        # ---- 保存 ----
-        dst = SAVE_DIR / f"{stu_idx+1}_{src_path.name}"
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(dst), img)
-        print("✔ 批注图已保存 →", _pretty_path(dst))
-
-# -------------------------------------------------- CLI --------------------------------------------------
 if __name__ == "__main__":
-    export_excel()
-    save_all_marked_images()
+    Teacher().run()
